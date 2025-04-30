@@ -3,7 +3,7 @@
 
 ## Setup ##
 ```bash
-git clone 
+git clone https://github.com/yashizhang/ContKukanov.git
 conda create -p ./conda_env python=3.12
 conda activate ./conda_env
 pip install numpy pandas
