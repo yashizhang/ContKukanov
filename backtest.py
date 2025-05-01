@@ -25,8 +25,7 @@ def parse(file_path: str) -> pd.DataFrame:
     df = pd.read_csv(file_path)
     required_columns = [
         'ts_event', 'publisher_id', 
-        'ask_px_00', 'ask_sz_00',
-        'bid_px_00', 'bid_sz_00'
+        'ask_px_00', 'ask_sz_00'
     ]
     assert all(col in df.columns for col in required_columns), \
         f"Missing one or more required columns. Required: {required_columns}"
@@ -40,8 +39,6 @@ def parse(file_path: str) -> pd.DataFrame:
     df['venue'] = df.apply(lambda row: Venue(
         ask=row['ask_px_00'],
         ask_sz=row['ask_sz_00'],
-        fee=0.0000,
-        rebate=0.0030
     ), axis=1)
     df = df.groupby('ts_event')['venue'].apply(list).reset_index()
     df = df.set_index('ts_event')
@@ -305,6 +302,7 @@ def backtest_contkukanov(
     lam_over: float = 0.05,
     theta_queue: float = 0.0005
 ) -> float:
+    CHUNK = 100
     order_size = 5000
     orders_filled = 0
     time_idx = 0
@@ -313,8 +311,10 @@ def backtest_contkukanov(
     while orders_filled < order_size and time_idx < len(df):
         venue_list = df['venue'].iloc[time_idx]
         remaining = order_size - orders_filled
-        split, cost = allocate(
-            order_size=remaining,
+
+        chunk_size = min(remaining, CHUNK)
+        split, _ = allocate(
+            order_size=chunk_size,
             venues=venue_list,
             lambda_over=lam_over,
             lambda_under=lam_under,
@@ -325,6 +325,14 @@ def backtest_contkukanov(
             continue
         executed = sum(min(s, v.ask_sz) for s, v in zip(split, venue_list))
         orders_filled += executed
+        cost = compute_cost(
+            split=split,
+            venues=venue_list,
+            order_size=remaining,
+            lambda_over=lam_over,
+            lambda_under=lam_under,
+            theta_queue=theta_queue
+        )
         total_cost += cost
         time_idx += 1
 
@@ -335,7 +343,9 @@ def optimize_contkukanov(grid: List[Tuple[float, float, float]], df: pd.DataFram
     best_params = None
     for lam_under, lam_over, theta_queue in grid:
         cost = backtest_contkukanov(df, lam_under, lam_over, theta_queue)
-        if cost < best_cost:
+        if cost == 0:
+            continue
+        elif cost < best_cost:
             best_cost = cost
             best_params = (lam_under, lam_over, theta_queue)
     return best_cost, best_params
@@ -361,7 +371,9 @@ def optimize_contkukanov_parallel(grid: List[Tuple[float, float, float]], df: pd
         }
         for future in concurrent.futures.as_completed(future_to_params):
             cost, params = future.result()
-            if cost < best_cost:
+            if cost == 0:
+                continue
+            elif cost < best_cost:
                 best_cost = cost
                 best_params = params
     if best_params is None:
@@ -387,7 +399,7 @@ if __name__ == '__main__':
     print(f'VWAP Total Cost: {backtest_vwap(df):.2f}')
     print(f'Cont-Kukanov Total Cost: {backtest_contkukanov(df):.2f}\n')
 
-    param = np.array([1e-5, 5e-5, 1e-4, 5e-4, 1e-3, 5e-3, 1e-2, 5e-2, 1e-1, 5e-1])
+    param = np.array([1e-5, 5e-5, 1e-4, 5e-4, 1e-3, 5e-3, 1e-2, 5e-2, 1e-1])
     grid = product(param, param, param)
 
     print(f"Optimizing risk parameters over uniform grid: {[float(x) for x in param]}")
