@@ -1,4 +1,4 @@
-# Implementation of the Cont-Kukanov Optimal Order Execution Model #
+# Implementation of the [Cont-Kukanov Optimal Order Execution Model](https://arxiv.org/pdf/1210.1625) #
 
 
 ## Setup ##
@@ -31,5 +31,3 @@ I also had the option of using the values in the Cont & Kukanov paper, but the v
 2. For simplicity and due to personal time constraints, I will not be modeling our own market impact. Ideally, every time we execute a trade of order size `sz` at price `ask`, we should update the following ticks' orderbooks size at price level `ask` to be `original_size - sz` (i.e. actually model the liquidity being taken away by our market order). 
 
 3. I added a condition in the allocate function: if there are no good splits to check through (e.g. the best ask size is too small), we return None, None. This way, the backtest function knows to skip the current timestamp and go to the next timestamp. 
-
-4. I also did not use a validation test to validate if the optimized lambda_under, lambda_over, and theta_queue functions were being overfit. This boils down to an time-invariant market regime assumption (?).
