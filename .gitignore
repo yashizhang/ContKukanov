@@ -1,4 +1,3 @@
 conda_env/
 .vscode/
-*.csv
 *.txt

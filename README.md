@@ -59,3 +59,7 @@ the NASDAQ and NYSE:
 * Performs grid search to optimize risk parameters (λ_under, λ_over, θ_queue)
 
 The code implements and compares different trading execution strategies with a focus on the Cont-Kukanov model, allowing for both default and optimized risk parameters.
+
+## Bugs ##
+* Either the dataset given is not representative enough or the pseudo-code is not fully correct, leading to trivial optimizations with respect to the risk parameters. 
+* The data given only contains order book data from a single venue, which may affect correctness and may show lack of performance increase when there should be. 
