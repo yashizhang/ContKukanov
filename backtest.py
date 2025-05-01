@@ -1,9 +1,12 @@
 import os 
-from typing import List, Tuple
+import concurrent.futures
+import json
+from itertools import product
+import multiprocessing
+from typing import List, Tuple, Optional
 from dataclasses import dataclass
 import pandas as pd 
 import numpy as np 
-import json
 
 
 @dataclass 
@@ -74,51 +77,73 @@ def parse(file_path: str) -> pd.DataFrame:
     
     return df
 
-def allocate(order_size: int, 
-             venues: List[Venue], 
-             lam_over: float, 
-             lam_under: float, 
-             theta_queue: float) -> Tuple[List[int], float]:
-    step = 100
-    splits = [[]]
+def compute_cost(
+    split:          List[int],
+    venues:         List[Venue],
+    order_size:     int,
+    lambda_over:    float,
+    lambda_under:   float,
+    theta_queue:    float,
+) -> float:
+    executed   = 0
+    cash_spent = 0.0
+
+    for i, v in enumerate(venues):
+        exe = min(split[i], v.ask_sz)
+        executed   += exe
+        cash_spent += exe * (v.ask + v.fee)
+        maker_rebate = max(split[i] - exe, 0) * v.rebate
+        cash_spent  -= maker_rebate
+
+    underfill = max(order_size - executed, 0)
+    overfill  = max(executed - order_size, 0)
+    risk_pen  = theta_queue * (underfill + overfill)
+    cost_pen  = lambda_under * underfill + lambda_over * overfill
+
+    return cash_spent + risk_pen + cost_pen
+
+def allocate(
+    order_size:    int,
+    venues:        List[Venue],
+    lambda_over:   float,
+    lambda_under:  float,
+    theta_queue:   float,
+    step:          int = 100, 
+) -> Tuple[Optional[List[int]], Optional[float]]:
+    """
+    Returns (split, cost) if an exact order_size split is found in 'step'-share chunks,
+    or (None, None) otherwise — so the caller can skip to the next timestamp.
+    """
+    splits: List[List[int]] = [[]]
     for v in range(len(venues)):
-        new_splits = []
+        new_splits: List[List[int]] = []
         for alloc in splits:
-            used = sum(alloc)
+            used  = sum(alloc)
             max_v = min(order_size - used, venues[v].ask_sz)
             for q in range(0, max_v + 1, step):
                 new_splits.append(alloc + [q])
         splits = new_splits
-    best_cost = float('inf')
-    best_split = []
+
+    best_cost: float = float('inf')
+    best_split: List[int] = []
+
     for alloc in splits:
         if sum(alloc) != order_size:
             continue
-        cost = compute_cost(alloc, venues, order_size, lam_over, lam_under, theta_queue)
+        cost = compute_cost(alloc,
+                            venues = venues,
+                            order_size = order_size,
+                            lambda_over = lambda_over,
+                            lambda_under = lambda_under,
+                            theta_queue = theta_queue)
         if cost < best_cost:
-            best_cost = cost
-            best_split = alloc
-    return best_split, best_cost
+            best_cost, best_split = cost, alloc
 
-def compute_cost(split: List[int], 
-                 venues: List[Venue], 
-                 order_size: int, 
-                 lam_over: float, 
-                 lam_under: float, 
-                 theta_queue: float) -> float:
-    executed = 0
-    cash_spent = 0.0
-    for i in range(len(venues)):
-        exe = min(split[i], venues[i].ask_sz)
-        executed += exe
-        cash_spent += exe * (venues[i].ask + venues[i].fee)
-        maker_rebate = max(split[i] - exe, 0) * venues[i].rebate
-        cash_spent -= maker_rebate
-    underfill = max(order_size - executed, 0)
-    overfill = max(executed - order_size, 0)
-    risk_pen = theta_queue * (underfill + overfill)
-    cost_pen = lam_under * underfill + lam_over * overfill
-    return cash_spent + risk_pen + cost_pen
+    # if we never found exactly order_size, return (None, None)
+    if not best_split:
+        return None, None
+
+    return best_split, best_cost
 
 def backtest_take_best_ask(df: pd.DataFrame) -> float:
     """
@@ -143,18 +168,16 @@ def backtest_take_best_ask(df: pd.DataFrame) -> float:
         
         # Find the venue with the best (lowest) ask price
         best_ask = min(venue_list, key=lambda x: x.ask)
-        best_ask_idx = venue_list.index(best_ask)
 
-        # Create order split targeting only the best ask venue
-        split = [0 for _ in range(len(venue_list))]
-        # Take as many shares as possible from best ask, up to what we still need
-        split[best_ask_idx] = min(order_size - orders_filled, best_ask.ask_sz)
-
-        # Calculate cost for this execution
-        cost = compute_cost(split, venue_list, order_size, 0, 0, 0)
+        # Calculate shares to execute at this venue
+        shares_to_execute = min(order_size - orders_filled, best_ask.ask_sz)
+        
+        # Calculate direct execution cost including fees
+        execution_cost = shares_to_execute * (best_ask.ask + best_ask.fee)
+        
         # Update running totals
-        orders_filled += split[best_ask_idx]
-        total_cost += cost
+        orders_filled += shares_to_execute
+        total_cost += execution_cost
 
         # Move to next tick of market data
         time_idx += 1
@@ -205,9 +228,8 @@ def backtest_twap(df: pd.DataFrame) -> float:
                 # Sort venues by how close their ask is to TWAP price
                 sorted_venues = sorted(venues, key=lambda v: abs(v.ask - twap_price))
                 
-                # Create split order targeting venues closest to TWAP
-                split = [0] * len(venues)
-                for i, venue in enumerate(sorted_venues):
+                # Execute trades at venues closest to TWAP
+                for venue in sorted_venues:
                     if orders_filled >= order_size:
                         break
                         
@@ -219,13 +241,10 @@ def backtest_twap(df: pd.DataFrame) -> float:
                     )
                     
                     if shares_needed > 0:
-                        venue_idx = venues.index(venue)
-                        split[venue_idx] = shares_needed
-                        
-                # Execute the split and compute cost
-                cost = compute_cost(split, venues, order_size, 0, 0, 0)
-                orders_filled += sum(split)
-                total_cost += cost
+                        # Calculate direct execution cost including fees
+                        execution_cost = shares_needed * (venue.ask + venue.fee)
+                        orders_filled += shares_needed
+                        total_cost += execution_cost
             
             # Reset for next bucket
             bucket_prices = []
@@ -293,8 +312,7 @@ def backtest_vwap(df: pd.DataFrame) -> float:
                 sorted_venues = sorted(venues, 
                                     key=lambda v: (abs(v.ask - vwap_price), -v.ask_sz))
                 
-                # Create split order targeting venues closest to VWAP
-                split = [0] * len(venues)
+                # Execute trades at venues closest to VWAP
                 for venue in sorted_venues:
                     if orders_filled >= order_size:
                         break
@@ -309,13 +327,10 @@ def backtest_vwap(df: pd.DataFrame) -> float:
                     )
                     
                     if shares_needed > 0:
-                        venue_idx = venues.index(venue)
-                        split[venue_idx] = shares_needed
-                        
-                # Execute the split and compute cost
-                cost = compute_cost(split, venues, order_size, 0, 0, 0)
-                orders_filled += sum(split)
-                total_cost += cost
+                        # Calculate direct execution cost including fees
+                        execution_cost = shares_needed * (venue.ask + venue.fee)
+                        orders_filled += shares_needed
+                        total_cost += execution_cost
             
             # Reset for next bucket
             bucket_prices = []
@@ -329,104 +344,156 @@ def backtest_vwap(df: pd.DataFrame) -> float:
             
     return total_cost
 
-def backtest_contkukanov(df: pd.DataFrame) -> Tuple[float, dict]:
+def backtest_contkukanov(df: pd.DataFrame, 
+                        lam_under: float = 0.05,
+                        lam_over: float = 0.05,
+                        theta_queue: float = 0.0005) -> float:
     """
-    Implement the Cont-Kukanov strategy with parameter optimization.
-    First performs grid search to find optimal parameters, then executes the strategy.
+    Implement the Cont-Kukanov model to buy 5000 shares using optimal allocation.
+    This strategy uses the allocate() function to determine optimal order splits
+    across venues at each tick.
+    
+    Args:
+        df: DataFrame with market data indexed by timestamp
+        lam_under: Cost penalty per unfilled share (default: 0.05)
+        lam_over: Cost penalty per extra share bought (default: 0.05)
+        theta_queue: Queue-risk penalty parameter (default: 0.0005)
+        
+    Returns:
+        float: Total cost of execution
+    """
+    order_size = 5000  # Total shares to buy
+    orders_filled = 0  # Running count of shares filled
+    time_idx = 0      # Current position in the market data
+    total_cost = 0    # Accumulator for total execution cost
+    
+    while orders_filled < order_size and time_idx < len(df):
+        # Get current venue list
+        venue_list = df['venue'].iloc[time_idx]
+        
+        # Calculate remaining shares to fill
+        remaining_size = order_size - orders_filled
+        
+        # Get optimal split using Cont-Kukanov allocation
+        split, cost = allocate(
+            order_size=remaining_size,
+            venues=venue_list,
+            lambda_over=lam_over,
+            lambda_under=lam_under,
+            theta_queue=theta_queue
+        )
+
+        if split is None:
+            time_idx += 1
+            continue
+        
+        # Execute the split and update totals
+        executed = sum(min(s, v.ask_sz) for s, v in zip(split, venue_list))
+        orders_filled += executed
+        total_cost += cost
+        
+        # Move to next tick
+        time_idx += 1
+        
+    return total_cost
+
+def optimize_contkukanov(df: pd.DataFrame) -> Tuple[float, float, float]:
+    """
+    Optimize the Cont-Kukanov model parameters for the given market data.
+    
+    Args:
+        df: DataFrame with market data indexed by timestamp
+        
+    """
+    grid = product(np.logspace(-5, 2, 30),
+                   np.logspace(-5, 2, 30),
+                   np.logspace(-5, 2, 30))
+    
+    best_cost = float('inf')
+    best_params = None
+
+    for lam_under, lam_over, theta_queue in grid:
+        cost = backtest_contkukanov(df, lam_under, lam_over, theta_queue)
+        if cost < best_cost:
+            best_cost = cost
+            best_params = (lam_under, lam_over, theta_queue)
+
+    return best_cost, best_params
+    
+def optimize_contkukanov_parallel(df: pd.DataFrame) -> Tuple[float, Tuple[float, float, float]]:
+    """
+    Optimize the Cont-Kukanov model parameters for the given market data using parallel processing.
     
     Args:
         df: DataFrame with market data indexed by timestamp
         
     Returns:
-        Tuple[float, dict]: Total execution cost and dictionary of optimal parameters
+        Tuple[float, Tuple[float, float, float]]: Best cost and corresponding parameters 
+        (lambda_under, lambda_over, theta_queue)
     """
-    order_size = 5000
+    # Generate parameter grid
+    param_grid = list(product(
+        np.logspace(-5, 2, 30),  # lambda_under
+        np.logspace(-5, 2, 30),  # lambda_over
+        np.logspace(-5, 2, 30)   # theta_queue
+    ))
     
-    # First phase: Grid search for optimal parameters
-    def grid_search() -> Tuple[float, float, float]:
-        best_params = None
-        best_total_cost = float('inf')
-        
-        # Create grid of parameters
-        param_values = np.linspace(0, 1, 100)  # 10 subdivisions in [0,1]
-        
-        # Try first 100 timestamps for parameter optimization
-        sample_size = min(100, len(df))
-        sample_df = df.iloc[:sample_size]
-        
-        for lam_over in param_values:
-            for lam_under in param_values:
-                for theta_queue in param_values:
-                    total_cost = 0
-                    orders_filled = 0
-                    
-                    # Test these parameters on sample data
-                    for time_idx in range(sample_size):
-                        if orders_filled >= order_size:
-                            break
-                            
-                        venue_list = sample_df['venue'].iloc[time_idx]
-                        
-                        # Get optimal split using Cont-Kukanov allocator
-                        remaining = order_size - orders_filled
-                        split, cost = allocate(
-                            remaining, venue_list, 
-                            lam_over, lam_under, theta_queue
-                        )
-                        
-                        orders_filled += sum(split)
-                        total_cost += cost
-                        
-                    # Update best parameters if current ones are better
-                    if total_cost < best_total_cost and orders_filled == order_size:
-                        best_total_cost = total_cost
-                        best_params = (lam_over, lam_under, theta_queue)
-        
-        return best_params
+    # Get number of available CPU cores
+    num_cores = multiprocessing.cpu_count()
+    max_workers = min(num_cores * 2, len(param_grid))  # Use 2 threads per core
+    print(f"Optimizing using {max_workers} threads across {num_cores} CPU cores")
     
-    # Run grid search to find optimal parameters
-    print("Running grid search for optimal parameters...")
-    optimal_params = grid_search()
+    def evaluate_params(params: Tuple[float, float, float]) -> Tuple[float, Tuple[float, float, float]]:
+        """Helper function to evaluate a single parameter set"""
+        lam_under, lam_over, theta_queue = params
+        cost = backtest_contkukanov(df, lam_under, lam_over, theta_queue)
+        return cost, params
     
-    if optimal_params is None:
-        raise ValueError("Could not find valid parameters that complete the order")
+    best_cost = float('inf')
+    best_params = None
+    
+    # Use ThreadPoolExecutor for parallel processing
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all parameter combinations for evaluation
+        future_to_params = {
+            executor.submit(evaluate_params, params): params 
+            for params in param_grid
+        }
         
-    lam_over, lam_under, theta_queue = optimal_params
-    print(f"Optimal parameters found: λ_over={lam_over:.4f}, λ_under={lam_under:.4f}, θ_queue={theta_queue:.4f}")
-    
-    # Second phase: Execute strategy with optimal parameters
-    orders_filled = 0
-    time_idx = 0
-    total_cost = 0
-    
-    while orders_filled < order_size and time_idx < len(df):
-        venue_list = df['venue'].iloc[time_idx]
+        # Process results as they complete
+        completed = 0
+        total_tasks = len(param_grid)
         
-        # Get optimal split using Cont-Kukanov allocator with optimized parameters
-        remaining = order_size - orders_filled
-        split, cost = allocate(
-            remaining, venue_list,
-            lam_over, lam_under, theta_queue
-        )
+        for future in concurrent.futures.as_completed(future_to_params):
+            completed += 1
+            try:
+                cost, params = future.result()
+                if cost < best_cost:
+                    best_cost = cost
+                    best_params = params
+                    print(f"New best cost {best_cost:.2f} found with parameters {best_params}")
+            except Exception as e:
+                print(f"Parameter evaluation failed: {e}")
+    
+    if best_params is None:
+        raise RuntimeError("Optimization failed to find valid parameters")
         
-        orders_filled += sum(split)
-        total_cost += cost
-        time_idx += 1
-    
-    # Package optimal parameters in dictionary
-    optimal_params_dict = {
-        'lambda_over': lam_over,
-        'lambda_under': lam_under,
-        'theta_queue': theta_queue
-    }
-    
-    return total_cost, optimal_params_dict
+    return best_cost, best_params
 
 if __name__ == '__main__':
-    df = parse('l1_day.csv')
+    df = parse('l1_day_changed_publisher_id.csv')
     print(f'Naive Best Ask: {backtest_take_best_ask(df)}')
     print(f'TWAP: {backtest_twap(df)}')
     print(f'VWAP: {backtest_vwap(df)}')
-    cost, params = backtest_contkukanov(df)
-    print(f'Cont-Kukanov cost: {cost}')
-    print(f'Optimal parameters: {params}')
+    print(f'Default Cont-Kukanov: {backtest_contkukanov(df)}')
+
+
+    print("\nOptimizing Cont-Kukanov parameters...")
+    # best_cost, (best_lam_under, best_lam_over, best_theta_queue) = optimize_contkukanov_parallel(df)
+    best_cost, (best_lam_under, best_lam_over, best_theta_queue) = optimize_contkukanov(df)
+    print("\nOptimization Results:")
+    print(f'Best Cost: {best_cost:.2f}')
+    print(f'Best Parameters:')
+    print(f'  lambda_under: {best_lam_under:.6f}')
+    print(f'  lambda_over:  {best_lam_over:.6f}')
+    print(f'  theta_queue:  {best_theta_queue:.6f}')
